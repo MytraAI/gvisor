@@ -323,6 +323,10 @@ type Config struct {
 	// Use systemd to configure cgroups.
 	SystemdCgroup bool `flag:"systemd-cgroup"`
 
+	// TimeDilation is the integer factor by which all sandbox-visible
+	// clocks run faster than host time. 1 means disabled.
+	TimeDilation int64 `flag:"time-dilation"`
+
 	// PodInitConfig is the path to configuration file with additional steps to
 	// take during pod creation.
 	PodInitConfig string `flag:"pod-init-config"`
@@ -489,6 +493,9 @@ type Config struct {
 // Config.Override does not validate, so callers must call Validate once they
 // are done overriding.
 func (c *Config) Validate() error {
+	if c.TimeDilation < 1 || c.TimeDilation > 64 {
+		return fmt.Errorf("time-dilation must be in [1, 64], got: %d", c.TimeDilation)
+	}
 	if c.Overlay && c.Overlay2.Enabled() {
 		// Deprecated flag was used together with flag that replaced it.
 		return fmt.Errorf("overlay flag has been replaced with overlay2 flag")

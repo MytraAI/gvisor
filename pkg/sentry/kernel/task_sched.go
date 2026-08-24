@@ -223,6 +223,19 @@ func (k *Kernel) runCPUClockTicker() {
 	)
 	concurrencyCount := k.ConcurrencyCount()
 
+	// Under time dilation, app-visible CPU clocks (times(2), getrusage,
+	// CLOCK_*_CPUTIME_ID, ITIMER_VIRTUAL/PROF) must advance at the same
+	// dilated rate as wall time, or apps would compute nonsensical CPU
+	// percentages. The tick cadence stays in host time; each tick just
+	// accounts a dilated increment. k.cpuClock (sentry-internal, watchdog)
+	// deliberately stays at host rate.
+	appTickInc := linux.ClockTick
+	appTickIncNS := linux.ClockTick.Nanoseconds()
+	if k.timekeeper != nil && k.timekeeper.dilationEnabled() {
+		appTickIncNS = k.timekeeper.dilateNS(appTickIncNS)
+		appTickInc = time.Duration(appTickIncNS)
+	}
+
 	for {
 		// Stop CPU clocks while nothing is running.
 		if k.runningTasks.Load() == 0 {
@@ -303,26 +316,26 @@ func (k *Kernel) runCPUClockTicker() {
 		for _, t := range incTasks[:numIncTasks] {
 			switch t.TaskGoroutineState() {
 			case TaskGoroutineRunningApp:
-				t.appCPUClock.Add(linux.ClockTick)
+				t.appCPUClock.Add(appTickInc)
 				t.tg.appCPUClockLast.Store(t)
-				t.tg.appCPUClock.Add(linux.ClockTick)
+				t.tg.appCPUClock.Add(appTickInc)
 				userTickInc++
 				if preempt {
 					t.p.Preempt()
 				}
 				fallthrough
 			case TaskGoroutineRunningSys:
-				t.appSysCPUClock.Add(linux.ClockTick)
+				t.appSysCPUClock.Add(appTickInc)
 				t.tg.appSysCPUClockLast.Store(t)
-				t.tg.appSysCPUClock.Add(linux.ClockTick)
+				t.tg.appSysCPUClock.Add(appTickInc)
 				userSysTickInc++
 			}
 		}
 		if userTickInc != 0 {
-			k.userCPUClock.Add(userTickInc * linux.ClockTick.Nanoseconds())
+			k.userCPUClock.Add(userTickInc * appTickIncNS)
 		}
 		if userSysTickInc != 0 {
-			k.userSysCPUClock.Add(userSysTickInc * linux.ClockTick.Nanoseconds())
+			k.userSysCPUClock.Add(userSysTickInc * appTickIncNS)
 		}
 
 		// Reset storage for the next iteration.

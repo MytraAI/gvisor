@@ -16,6 +16,7 @@ package kernel
 
 import (
 	"fmt"
+	"math/bits"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
@@ -127,6 +128,24 @@ type Timekeeper struct {
 
 	// vDSO parameter page kept updated by the Timekeeper mechanism
 	params *VDSOParamPage `state:"nosave"`
+
+	// dilationNum and dilationDen express the sandbox time dilation factor
+	// as a rational number: app-visible clocks advance dilationNum
+	// nanoseconds per dilationDen host nanoseconds. Both are 1 when
+	// dilation is disabled. Set at most once, by SetDilation, before
+	// SetClocks; not saved, so a restored sandbox must have SetDilation
+	// re-applied (from runsc config) before SetClocks.
+	dilationNum uint64 `state:"nosave"`
+	dilationDen uint64 `state:"nosave"`
+
+	// dilationFloat is the same factor as a float64, used to convert
+	// dilated durations back to host wall durations for timer arming.
+	dilationFloat float64 `state:"nosave"`
+
+	// rawBootNS is the value of the backing CLOCK_MONOTONIC_RAW when
+	// SetClocks ran; it anchors dilation of MonotonicRaw the way bootTime
+	// anchors Realtime.
+	rawBootNS int64 `state:"nosave"`
 }
 
 // NewTimekeeper returns a Timekeeper that is automatically kept up-to-date.
@@ -134,10 +153,89 @@ type Timekeeper struct {
 //
 // SetClocks must be called on the returned Timekeeper before it is usable.
 func NewTimekeeper() *Timekeeper {
-	t := Timekeeper{}
+	t := Timekeeper{
+		dilationNum:   1,
+		dilationDen:   1,
+		dilationFloat: 1.0,
+	}
 	t.realtimeClock = &timekeeperClock{tk: &t, c: sentrytime.Realtime}
 	t.monotonicClock = &timekeeperClock{tk: &t, c: sentrytime.Monotonic}
 	return &t
+}
+
+// SetDilation sets the sandbox time dilation factor: all app-visible clocks
+// (and therefore all timers, sleeps, and timeouts) advance factor times
+// faster than host time. Realtime is anchored at boot time, so the sandbox
+// starts at the host wall time and diverges from it as the sandbox runs.
+//
+// SetDilation must be called before SetClocks (including after restore) and
+// at most once. A factor of 1 (or <= 0) disables dilation.
+func (t *Timekeeper) SetDilation(factor float64) {
+	if t.clocks != nil {
+		panic("SetDilation called after SetClocks")
+	}
+	if factor <= 0 || factor == 1.0 {
+		return
+	}
+	// Express the factor as a rational with millesimal precision so clock
+	// arithmetic stays exact and monotone.
+	num := uint64(factor*1000 + 0.5)
+	den := uint64(1000)
+	if num == 0 {
+		return
+	}
+	for d := gcd(num, den); d > 1; d = gcd(num, den) {
+		num /= d
+		den /= d
+	}
+	t.dilationNum = num
+	t.dilationDen = den
+	t.dilationFloat = float64(num) / float64(den)
+	log.Infof("Timekeeper: sandbox time dilation enabled: %d/%d (%v)", num, den, t.dilationFloat)
+}
+
+func gcd(a, b uint64) uint64 {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+// dilationEnabled returns true if a non-1 dilation factor is set.
+func (t *Timekeeper) dilationEnabled() bool {
+	return t.dilationNum != t.dilationDen
+}
+
+// dilateNS scales a (host-relative) nanosecond delta into dilated sandbox
+// nanoseconds using 128-bit intermediate math, so large deltas and
+// non-integer factors cannot overflow.
+func (t *Timekeeper) dilateNS(ns int64) int64 {
+	neg := false
+	v := uint64(ns)
+	if ns < 0 {
+		neg = true
+		v = uint64(-ns)
+	}
+	hi, lo := bits.Mul64(v, t.dilationNum)
+	// The quotient always fits: dilated results are themselves int64
+	// nanoseconds, so hi < dilationDen holds for all reachable inputs.
+	q, _ := bits.Div64(hi, lo, t.dilationDen)
+	r := int64(q)
+	if neg {
+		r = -r
+	}
+	return r
+}
+
+// dilateFrequency scales a cycle-counter frequency down by the dilation
+// factor, which makes vDSO time computed from raw cycles advance
+// dilationNum/dilationDen times faster.
+func (t *Timekeeper) dilateFrequency(freq uint64) uint64 {
+	f := freq * t.dilationDen / t.dilationNum
+	if f == 0 {
+		f = 1
+	}
+	return f
 }
 
 // SetClocks the backing clock source.
@@ -170,6 +268,13 @@ func (t *Timekeeper) SetClocks(c sentrytime.Clocks, params *VDSOParamPage) {
 	// configuration, not the checkpointed one.
 	if c.MonotonicRawEnabled() {
 		t.monotonicRawClock = &timekeeperClock{tk: t, c: sentrytime.MonotonicRaw}
+		if t.dilationEnabled() {
+			nowRaw, err := t.clocks.GetTime(sentrytime.MonotonicRaw)
+			if err != nil {
+				panic("Unable to get current monotonic raw time: " + err.Error())
+			}
+			t.rawBootNS = nowRaw
+		}
 	}
 
 	// Compute the offset of the monotonic clock from the base Clocks.
@@ -251,6 +356,28 @@ func (t *Timekeeper) update(parked bool) {
 			p.monotonicRawBaseCycles = int64(res.MonotonicRaw.BaseCycles)
 			p.monotonicRawBaseRef = int64(res.MonotonicRaw.BaseRef)
 			p.monotonicRawFrequency = res.MonotonicRaw.Frequency
+		}
+		if t.dilationEnabled() {
+			// Dilate the params the vDSO computes time from:
+			// compute_time = base_ref + delta_cycles * 1e9 / frequency,
+			// so scaling frequency down scales the rate up, and the
+			// base refs are moved onto the dilated timeline. Monotonic
+			// is anchored at 0 (base ref already includes
+			// monotonicOffset), realtime at bootTime, raw at its value
+			// when SetClocks ran.
+			if p.monotonicReady != 0 {
+				p.monotonicBaseRef = t.dilateNS(p.monotonicBaseRef)
+				p.monotonicFrequency = t.dilateFrequency(p.monotonicFrequency)
+			}
+			if p.realtimeReady != 0 {
+				bootNS := t.bootTime.Nanoseconds()
+				p.realtimeBaseRef = bootNS + t.dilateNS(p.realtimeBaseRef-bootNS)
+				p.realtimeFrequency = t.dilateFrequency(p.realtimeFrequency)
+			}
+			if p.monotonicRawReady != 0 {
+				p.monotonicRawBaseRef = t.rawBootNS + t.dilateNS(p.monotonicRawBaseRef-t.rawBootNS)
+				p.monotonicRawFrequency = t.dilateFrequency(p.monotonicRawFrequency)
+			}
 		}
 		return p
 	}); err != nil {
@@ -431,8 +558,24 @@ func (t *Timekeeper) GetTime(c sentrytime.ClockID) (int64, error) {
 	defer t.release()
 
 	now, err := t.clocks.GetTime(c)
+	if err == nil && t.dilationEnabled() {
+		// Move the sample onto the dilated timeline, using the same
+		// anchors as update() so the syscall and vDSO paths agree.
+		switch c {
+		case sentrytime.Monotonic:
+			// Handled below: dilation composes with monotonicOffset.
+		case sentrytime.Realtime:
+			bootNS := t.bootTime.Nanoseconds()
+			now = bootNS + t.dilateNS(now-bootNS)
+		case sentrytime.MonotonicRaw:
+			now = t.rawBootNS + t.dilateNS(now-t.rawBootNS)
+		}
+	}
 	if err == nil && c == sentrytime.Monotonic {
 		now += t.monotonicOffset
+		if t.dilationEnabled() {
+			now = t.dilateNS(now)
+		}
 		for {
 			// It's possible that the clock is shaky. This may be due to
 			// platform issues, e.g. the KVM platform relies on the guest
@@ -465,12 +608,23 @@ type timekeeperClock struct {
 	tk *Timekeeper
 	c  sentrytime.ClockID
 
-	// Implements ktime.SampledClock.WallTimeUntil.
-	ktime.WallRateClock `state:"nosave"`
-
 	// Implements waiter.Waitable. (We have no ability to detect
 	// discontinuities from external changes to CLOCK_REALTIME).
 	ktime.NoClockEvents `state:"nosave"`
+}
+
+// WallTimeUntil implements ktime.SampledClock.WallTimeUntil.
+//
+// Deadlines are in dilated sandbox time, but the kicker timers that wake
+// SampledTimer goroutines sleep in host wall time, so the remaining duration
+// must be converted back. Float rounding is fine here: SampledTimer
+// re-samples the clock on every wakeup, so an early wakeup just re-arms.
+func (tc *timekeeperClock) WallTimeUntil(t, now ktime.Time) time.Duration {
+	d := t.Sub(now)
+	if f := tc.tk.dilationFloat; f > 1 {
+		return time.Duration(float64(d) / f)
+	}
+	return d
 }
 
 // Now implements ktime.Clock.Now.
