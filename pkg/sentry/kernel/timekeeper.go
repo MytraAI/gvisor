@@ -143,9 +143,21 @@ type Timekeeper struct {
 	dilationFloat float64 `state:"nosave"`
 
 	// rawBootNS is the value of the backing CLOCK_MONOTONIC_RAW when
-	// SetClocks ran; it anchors dilation of MonotonicRaw the way bootTime
-	// anchors Realtime.
+	// SetClocks ran; it anchors dilation of MonotonicRaw.
 	rawBootNS int64 `state:"nosave"`
+
+	// dilationEpochNS, if nonzero, is a fixed host CLOCK_REALTIME instant
+	// (in nanoseconds) used as the anchor of the realtime dilation
+	// transform. Sandboxes sharing the same epoch and factor agree on
+	// wall-clock time exactly, regardless of when each booted. Zero means
+	// anchor at this sandbox's own boot (the sandbox starts at host wall
+	// time but skews from other sandboxes by (N-1) x boot-time spread).
+	dilationEpochNS int64 `state:"nosave"`
+
+	// rtAnchorNS is the resolved realtime dilation anchor: dilationEpochNS
+	// if set, else the host realtime sampled at SetClocks. Set by
+	// SetClocks.
+	rtAnchorNS int64 `state:"nosave"`
 }
 
 // NewTimekeeper returns a Timekeeper that is automatically kept up-to-date.
@@ -170,12 +182,20 @@ func NewTimekeeper() *Timekeeper {
 //
 // SetDilation must be called before SetClocks (including after restore) and
 // at most once. A factor of 1 (or <= 0) disables dilation.
-func (t *Timekeeper) SetDilation(factor float64) {
+//
+// epochNS, if nonzero, is a fixed host CLOCK_REALTIME instant (nanoseconds)
+// anchoring the realtime transform; all sandboxes given the same factor and
+// epoch agree on wall-clock time exactly. Zero anchors at this sandbox's own
+// boot.
+func (t *Timekeeper) SetDilation(factor float64, epochNS int64) {
 	if t.clocks != nil {
 		panic("SetDilation called after SetClocks")
 	}
 	if factor <= 0 || factor == 1.0 {
 		return
+	}
+	if epochNS > 0 {
+		t.dilationEpochNS = epochNS
 	}
 	// Express the factor as a rational with millesimal precision so clock
 	// arithmetic stays exact and monotone.
@@ -225,6 +245,12 @@ func (t *Timekeeper) dilateNS(ns int64) int64 {
 		r = -r
 	}
 	return r
+}
+
+// dilateRealtime moves a host CLOCK_REALTIME sample onto the dilated
+// timeline, anchored at rtAnchorNS.
+func (t *Timekeeper) dilateRealtime(ns int64) int64 {
+	return t.rtAnchorNS + t.dilateNS(ns-t.rtAnchorNS)
 }
 
 // dilateFrequency scales a cycle-counter frequency down by the dilation
@@ -310,9 +336,25 @@ func (t *Timekeeper) SetClocks(c sentrytime.Clocks, params *VDSOParamPage) {
 
 	t.monotonicOffset = wantMonotonic - nowMonotonic
 
+	if t.dilationEnabled() {
+		if t.dilationEpochNS > 0 {
+			t.rtAnchorNS = t.dilationEpochNS
+		} else {
+			t.rtAnchorNS = nowRealtime
+		}
+	}
+
 	if t.restored == nil {
-		// Hold on to the initial "boot" time.
-		t.bootTime = ktime.FromNanoseconds(nowRealtime)
+		// Hold on to the initial "boot" time, expressed on the dilated
+		// timeline so /proc btime, starttime, etc. stay coherent with
+		// the realtime clock apps observe. With a boot anchor this is
+		// the identity; with an epoch anchor boot lands ahead of host
+		// wall time.
+		bootNS := nowRealtime
+		if t.dilationEnabled() {
+			bootNS = t.dilateRealtime(nowRealtime)
+		}
+		t.bootTime = ktime.FromNanoseconds(bootNS)
 	}
 
 	t.mu.Lock()
@@ -370,8 +412,7 @@ func (t *Timekeeper) update(parked bool) {
 				p.monotonicFrequency = t.dilateFrequency(p.monotonicFrequency)
 			}
 			if p.realtimeReady != 0 {
-				bootNS := t.bootTime.Nanoseconds()
-				p.realtimeBaseRef = bootNS + t.dilateNS(p.realtimeBaseRef-bootNS)
+				p.realtimeBaseRef = t.dilateRealtime(p.realtimeBaseRef)
 				p.realtimeFrequency = t.dilateFrequency(p.realtimeFrequency)
 			}
 			if p.monotonicRawReady != 0 {
@@ -565,8 +606,7 @@ func (t *Timekeeper) GetTime(c sentrytime.ClockID) (int64, error) {
 		case sentrytime.Monotonic:
 			// Handled below: dilation composes with monotonicOffset.
 		case sentrytime.Realtime:
-			bootNS := t.bootTime.Nanoseconds()
-			now = bootNS + t.dilateNS(now-bootNS)
+			now = t.dilateRealtime(now)
 		case sentrytime.MonotonicRaw:
 			now = t.rawBootNS + t.dilateNS(now-t.rawBootNS)
 		}

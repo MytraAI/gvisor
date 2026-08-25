@@ -76,6 +76,7 @@ func RegisterFlags(flagSet *flag.FlagSet) {
 
 	// Timekeeping flags.
 	flagSet.Int64("time-dilation", 1, "EXPERIMENTAL. Integer factor by which all sandbox-visible clocks (and therefore timers, sleeps, and timeouts) run faster than host time. Realtime starts at host wall time and diverges as the sandbox runs. Default is 1 (disabled).")
+	flagSet.Int64("time-dilation-epoch", 0, "EXPERIMENTAL. Unix timestamp (seconds) anchoring the realtime dilation transform. Sandboxes sharing the same factor and epoch agree on wall-clock time exactly regardless of start order. Must be within the last 90 days. 0 (default) anchors each sandbox at its own boot.")
 	flagSet.String("coverage-report", "", "file path where Go coverage reports are written. Reports will only be generated if runsc is built with --collect_code_coverage and --instrumentation_filter Bazel flags.")
 	flagSet.Bool("log-packets", false, "enable network packet logging.")
 	flagSet.String("pcap-log", "", "location of PCAP log file.")

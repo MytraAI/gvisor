@@ -37,7 +37,7 @@ func TestSetDilationRational(t *testing.T) {
 		{6.001, 6001, 1000, true},
 	} {
 		tk := NewTimekeeper()
-		tk.SetDilation(tc.factor)
+		tk.SetDilation(tc.factor, 0)
 		if tk.dilationNum != tc.wantNum || tk.dilationDen != tc.wantDen {
 			t.Errorf("SetDilation(%v): got %d/%d, want %d/%d", tc.factor, tk.dilationNum, tk.dilationDen, tc.wantNum, tc.wantDen)
 		}
@@ -49,7 +49,7 @@ func TestSetDilationRational(t *testing.T) {
 
 func TestDilateNS(t *testing.T) {
 	tk := NewTimekeeper()
-	tk.SetDilation(6)
+	tk.SetDilation(6, 0)
 	for _, tc := range []struct {
 		in   int64
 		want int64
@@ -68,7 +68,7 @@ func TestDilateNS(t *testing.T) {
 
 	// Non-integer factor exercises the 128-bit path with a large input.
 	tk2 := NewTimekeeper()
-	tk2.SetDilation(6.001)
+	tk2.SetDilation(6.001, 0)
 	in := 365 * 24 * time.Hour.Nanoseconds()
 	want := int64(float64(in) * 6.001)
 	got := tk2.dilateNS(in)
@@ -79,7 +79,7 @@ func TestDilateNS(t *testing.T) {
 
 func TestDilateFrequency(t *testing.T) {
 	tk := NewTimekeeper()
-	tk.SetDilation(6)
+	tk.SetDilation(6, 0)
 	// 24 MHz (typical arm64 CNTFRQ) at 6x -> 4 MHz effective.
 	if got := tk.dilateFrequency(24_000_000); got != 4_000_000 {
 		t.Errorf("dilateFrequency(24MHz) = %d, want 4000000", got)
@@ -92,7 +92,7 @@ func TestDilateFrequency(t *testing.T) {
 
 func TestWallTimeUntilDilated(t *testing.T) {
 	tk := NewTimekeeper()
-	tk.SetDilation(6)
+	tk.SetDilation(6, 0)
 	tc := &timekeeperClock{tk: tk, c: sentrytime.Monotonic}
 
 	now := ktime.FromNanoseconds(0)
@@ -119,5 +119,37 @@ func TestWallTimeUntilDilated(t *testing.T) {
 	}
 	if tkRestored.dilationEnabled() {
 		t.Error("zeroed Timekeeper reports dilation enabled")
+	}
+}
+
+func TestSharedEpochAnchor(t *testing.T) {
+	// Two sandboxes with the same factor and epoch must map any host
+	// realtime instant to the same dilated instant, regardless of when
+	// each "booted" (i.e. what rtAnchorNS would have been without the
+	// epoch).
+	epoch := int64(1_700_000_000_000_000_000)
+	a := NewTimekeeper()
+	a.SetDilation(6, epoch)
+	a.rtAnchorNS = a.dilationEpochNS
+	b := NewTimekeeper()
+	b.SetDilation(6, epoch)
+	b.rtAnchorNS = b.dilationEpochNS
+
+	for _, hostNS := range []int64{
+		epoch,
+		epoch + time.Minute.Nanoseconds(),
+		epoch + 30*24*time.Hour.Nanoseconds(),
+	} {
+		if ga, gb := a.dilateRealtime(hostNS), b.dilateRealtime(hostNS); ga != gb {
+			t.Errorf("dilateRealtime(%d): a=%d b=%d, want equal", hostNS, ga, gb)
+		}
+	}
+	// The epoch itself is the fixed point.
+	if got := a.dilateRealtime(epoch); got != epoch {
+		t.Errorf("dilateRealtime(epoch) = %d, want %d", got, epoch)
+	}
+	// One minute after epoch maps to six minutes after epoch.
+	if got := a.dilateRealtime(epoch + time.Minute.Nanoseconds()); got != epoch+6*time.Minute.Nanoseconds() {
+		t.Errorf("dilateRealtime(epoch+1m) = %d, want epoch+6m", got)
 	}
 }

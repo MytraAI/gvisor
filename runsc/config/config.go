@@ -327,6 +327,11 @@ type Config struct {
 	// clocks run faster than host time. 1 means disabled.
 	TimeDilation int64 `flag:"time-dilation"`
 
+	// TimeDilationEpoch is a unix timestamp (seconds) anchoring the
+	// realtime dilation transform, shared across sandboxes so their wall
+	// clocks agree. 0 anchors each sandbox at its own boot.
+	TimeDilationEpoch int64 `flag:"time-dilation-epoch"`
+
 	// PodInitConfig is the path to configuration file with additional steps to
 	// take during pod creation.
 	PodInitConfig string `flag:"pod-init-config"`
@@ -495,6 +500,15 @@ type Config struct {
 func (c *Config) Validate() error {
 	if c.TimeDilation < 1 || c.TimeDilation > 64 {
 		return fmt.Errorf("time-dilation must be in [1, 64], got: %d", c.TimeDilation)
+	}
+	if c.TimeDilationEpoch != 0 {
+		// A stale epoch inflates the dilated offset (N x age); bound it
+		// so the transform stays far from int64-nanosecond overflow at
+		// any allowed factor.
+		age := time.Now().Unix() - c.TimeDilationEpoch
+		if age < 0 || age > 90*24*60*60 {
+			return fmt.Errorf("time-dilation-epoch must be within the last 90 days, got: %d", c.TimeDilationEpoch)
+		}
 	}
 	if c.Overlay && c.Overlay2.Enabled() {
 		// Deprecated flag was used together with flag that replaced it.
