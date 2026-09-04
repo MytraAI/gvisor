@@ -1,0 +1,10 @@
+# Default runsc handler config baked into the kind node image.
+#
+# mytra-helm-charts overwrites this at cluster-create with a values-driven
+# dilation factor + a shared epoch (see that repo's
+# local/pytra_ops/kind/write_gvisor_config.py), so this file is only the
+# standalone fallback when the image is run without that tooling.
+binary_name = "/usr/local/bin/runsc"
+[runsc_config]
+  platform = "systrap"
+  time-dilation = "6"
