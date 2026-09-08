@@ -1,0 +1,43 @@
+name: Build time-dilation kind node image
+
+# Publishes the multi-arch kind node image carrying the time-dilation-patched
+# gVisor runtime, consumed by MytraAI/mytra-helm-charts' local control plane.
+# Uses Mytra's shared multi-arch build/push reusable workflow.
+on:
+  push:
+    branches: [time-dilation]
+    paths:
+      - "runsc/**"
+      - "shim/**"
+      - "pkg/**"
+      - "vdso/**"
+      - "go.mod"
+      - "go.sum"
+      - "Dockerfile"
+      - "runsc.toml"
+      - ".github/workflows/build-time-dilation-image.yml"
+  workflow_dispatch:
+    inputs:
+      additional_image_tags:
+        description: "Extra docker tags to apply (space-separated), in addition to the commit SHA and `latest`"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: Build + publish mytra-kind-gvisor
+    # Native per-arch (amd64 + arm64) builds merged into a manifest list.
+    uses: MytraAI/build-tag-docker-image/.github/workflows/multiplatform-build.yml@v9
+    secrets: inherit
+    with:
+      gcloud_project_id: ${{ vars.MYTRA_ARTIFACTS_PROJECT_ID }}
+      gcloud_artifact_registry_region: ${{ vars.MYTRA_ARTIFACTS_LOCATION }}
+      gcloud_artifact_registry_repository: ${{ vars.MYTRA_ARTIFACTS_DOCKER_REPO }}
+      image_name: mytra-kind-gvisor
+      dockerfile_path: Dockerfile
+      # `latest` is auto-applied only on the default branch (master); this image
+      # is built from the time-dilation branch, so add it explicitly to give
+      # consumers a stable tag alongside the per-commit SHA tag.
+      additional_image_tags: ${{ inputs.additional_image_tags != '' && format('{0} latest', inputs.additional_image_tags) || 'latest' }}
+      push: true
+      aggressively_prune_and_assume_no_responsibility: true
